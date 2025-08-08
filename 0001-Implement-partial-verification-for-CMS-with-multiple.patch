@@ -1,0 +1,427 @@
+From c240316462103705bc60195e77683c5f827aa0f3 Mon Sep 17 00:00:00 2001
+From: Jan Luebbe <jlu@pengutronix.de>
+Date: Thu, 8 May 2025 14:58:52 +0200
+Subject: [PATCH 1/3] Implement partial verification for CMS with multiple
+ signatures
+
+Currently, OpenSSL supports creating CMS SignedData structures with
+multiple signers using CMS_sign() with the CMS_PARTIAL flag combined
+with CMS_add1_signer(). This can be done for a new SignedData or by
+adding signers to an existing structure. In addition to the C API, this
+is supported via openssl cms -sign (using multiple -signer options) and
+openssl cms -resign.
+
+The corresponding CMS_verify() function and openssl cms -verify command
+check the signatures sequentially and abort with an error on the first
+problem. They support some flags (CMS_NO_SIGNER_CERT_VERIFY,
+CMS_NO_ATTR_VERIFY, CMS_NO_CONTENT_VERIFY), which disable some aspects
+of the verification, but do not allow continuing after a failed
+signature verification.
+
+The main use cases for multiple signatures on one message are:
+
+* Simplify CA certificate roll-over by signing messages with keys in
+  both the old and new hierarchies during a transition period.
+  Recipients would have either the old or new CA installed (or
+  temporarily even both). In all cases, we'd like to accept any message
+  which as at least one signature that can be verified.
+
+* Support user-implemented verification policies which require
+  signatures from multiple specific signers.
+
+* Support user-implemented verification policies which require a minimum
+  number of signatures from different signers under under a trusted CA.
+
+This is made possible by adding a CMS_VERIFY_PARTIAL flag to CMS_verify()
+and exposing it through a new -verify_partial option to 'openssl cms
+-verify'.
+
+If this flag is set, the call is successful even if some of the
+individual signatures cannot be verified (perhaps due to CAs missing
+from the local store or expired certificates). The application would
+then call CMS_get0_signers() and check if the set of valid signatures
+satisfies its policy.
+
+Fixes #3028
+Fixes #26382
+---
+ apps/cms.c                  |  9 +++-
+ crypto/cms/cms_local.h      |  6 +++
+ crypto/cms/cms_smime.c      | 99 +++++++++++++++++++++++++++++++++----
+ doc/man1/openssl-cms.pod.in |  5 ++
+ doc/man3/CMS_verify.pod     | 13 +++--
+ include/openssl/cms.h.in    |  1 +
+ test/recipes/80-test_cms.t  | 79 ++++++++++++++++++++++++++++-
+ 7 files changed, 196 insertions(+), 16 deletions(-)
+
+diff --git a/apps/cms.c b/apps/cms.c
+index 919d306ff687..8be95b94ab34 100644
+--- a/apps/cms.c
++++ b/apps/cms.c
+@@ -64,7 +64,7 @@ typedef enum OPTION_choice {
+     OPT_COMMON,
+     OPT_INFORM, OPT_OUTFORM, OPT_IN, OPT_OUT, OPT_ENCRYPT,
+     OPT_DECRYPT, OPT_SIGN, OPT_CADES, OPT_SIGN_RECEIPT, OPT_RESIGN,
+-    OPT_VERIFY, OPT_VERIFY_RETCODE, OPT_VERIFY_RECEIPT,
++    OPT_VERIFY, OPT_VERIFY_PARTIAL, OPT_VERIFY_RETCODE, OPT_VERIFY_RECEIPT,
+     OPT_CMSOUT, OPT_DATA_OUT, OPT_DATA_CREATE, OPT_DIGEST_VERIFY,
+     OPT_DIGEST, OPT_DIGEST_CREATE, OPT_COMPRESS, OPT_UNCOMPRESS,
+     OPT_ED_DECRYPT, OPT_ED_ENCRYPT, OPT_DEBUG_DECRYPT, OPT_TEXT,
+@@ -211,8 +211,10 @@ const OPTIONS cms_options[] = {
+     {"nointern", OPT_NOINTERN, '-',
+      "Don't search certificates in message for signer"},
+     {"cades", OPT_DUP, '-', "Check signingCertificate (CAdES-BES)"},
++    {"verify_partial", OPT_VERIFY_PARTIAL, '-',
++     "Return success if at least one signature can be verified"},
+     {"verify_retcode", OPT_VERIFY_RETCODE, '-',
+-     "Exit non-zero on verification failure"},
++     "Exit non-zero on verification failure (depends on other verification options)"},
+     {"CAfile", OPT_CAFILE, '<', "Trusted certificates file"},
+     {"CApath", OPT_CAPATH, '/', "Trusted certificates directory"},
+     {"CAstore", OPT_CASTORE, ':', "Trusted certificates store URI"},
+@@ -453,6 +455,9 @@ int cms_main(int argc, char **argv)
+         case OPT_NO_ATTR_VERIFY:
+             flags |= CMS_NO_ATTR_VERIFY;
+             break;
++        case OPT_VERIFY_PARTIAL:
++            flags |= CMS_VERIFY_PARTIAL;
++            break;
+         case OPT_INDEF:
+             flags |= CMS_STREAM;
+             break;
+diff --git a/crypto/cms/cms_local.h b/crypto/cms/cms_local.h
+index 8ed67f5c19f4..287733906506 100644
+--- a/crypto/cms/cms_local.h
++++ b/crypto/cms/cms_local.h
+@@ -102,6 +102,12 @@ struct CMS_SignerInfo_st {
+     const CMS_CTX *cms_ctx;
+     /* Set to 1 if signing time attribute is to be omitted */
+     int omit_signing_time;
++    /* Remember which aspects have been verified */
++    int verify_result;
++    int verify_failure;
++    int cert_verified;
++    int attr_verified;
++    int content_verified;
+ };
+ 
+ struct CMS_SignerIdentifier_st {
+diff --git a/crypto/cms/cms_smime.c b/crypto/cms/cms_smime.c
+index 3f3d93fa0095..9ad5a46ff7c3 100644
+--- a/crypto/cms/cms_smime.c
++++ b/crypto/cms/cms_smime.c
+@@ -303,6 +303,20 @@ static int cms_signerinfo_verify_cert(CMS_SignerInfo *si,
+ 
+ }
+ 
++static int cms_signerinfos_remainig(STACK_OF(CMS_SignerInfo) *sinfos)
++{
++    int i, remaining = 0;
++
++    for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
++        CMS_SignerInfo *si = sk_CMS_SignerInfo_value(sinfos, i);
++
++        if (si->verify_failure == 0)
++            remaining++;
++    }
++
++    return remaining;
++}
++
+ /* This strongly overlaps with PKCS7_verify() */
+ int CMS_verify(CMS_ContentInfo *cms, STACK_OF(X509) *certs,
+                X509_STORE *store, BIO *dcont, BIO *out, unsigned int flags)
+@@ -341,6 +355,12 @@ int CMS_verify(CMS_ContentInfo *cms, STACK_OF(X509) *certs,
+         CMS_SignerInfo_get0_algs(si, NULL, &signer, NULL, NULL);
+         if (signer != NULL)
+             scount++;
++        /* Reset verification results */
++        si->verify_result = 0;
++        si->verify_failure = 0;
++        si->cert_verified = 0;
++        si->attr_verified = 0;
++        si->content_verified = 0;
+     }
+ 
+     if (scount != sk_CMS_SignerInfo_num(sinfos))
+@@ -377,29 +397,47 @@ int CMS_verify(CMS_ContentInfo *cms, STACK_OF(X509) *certs,
+ 
+             if (!cms_signerinfo_verify_cert(si, store, untrusted, crls,
+                                             si_chains ? &si_chains[i] : NULL,
+-                                            ctx))
+-                goto err;
++                                            ctx)) {
++                si->verify_failure = 1;
++                continue;
++            }
++            si->cert_verified = 1;
+         }
+     }
+ 
++    if (cms_signerinfos_remainig(sinfos) == 0)
++        goto err;
++
+     /* Attempt to verify all SignerInfo signed attribute signatures */
+ 
+     if ((flags & CMS_NO_ATTR_VERIFY) == 0 || cadesVerify) {
+         for (i = 0; i < scount; i++) {
+             si = sk_CMS_SignerInfo_value(sinfos, i);
+-            if (CMS_signed_get_attr_count(si) < 0)
++            if (si->verify_failure)
+                 continue;
+-            if (CMS_SignerInfo_verify(si) <= 0)
+-                goto err;
++            if (CMS_signed_get_attr_count(si) < 0) {
++                si->attr_verified = 1;
++                continue;
++            }
++            if (CMS_SignerInfo_verify(si) <= 0) {
++                si->verify_failure = 1;
++                continue;
++            }
+             if (cadesVerify) {
+                 STACK_OF(X509) *si_chain = si_chains ? si_chains[i] : NULL;
+ 
+-                if (ossl_cms_check_signing_certs(si, si_chain) <= 0)
+-                    goto err;
++                if (ossl_cms_check_signing_certs(si, si_chain) <= 0) {
++                    si->verify_failure = 1;
++                    continue;
++                }
+             }
++            si->attr_verified = 1;
+         }
+     }
+ 
++    if (cms_signerinfos_remainig(sinfos) == 0)
++        goto err;
++
+     /*
+      * Performance optimization: if the content is a memory BIO then store
+      * its contents in a temporary read only memory BIO. This avoids
+@@ -462,14 +500,57 @@ int CMS_verify(CMS_ContentInfo *cms, STACK_OF(X509) *certs,
+     if (!(flags & CMS_NO_CONTENT_VERIFY)) {
+         for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
+             si = sk_CMS_SignerInfo_value(sinfos, i);
++            if (si->verify_failure)
++                continue;
+             if (CMS_SignerInfo_verify_content(si, cmsbio) <= 0) {
+                 ERR_raise(ERR_LIB_CMS, CMS_R_CONTENT_VERIFY_ERROR);
+-                goto err;
++                si->verify_failure = 1;
++                continue;
+             }
++            si->content_verified = 1;
+         }
+     }
+ 
+-    ret = 1;
++    if (cms_signerinfos_remainig(sinfos) == 0)
++        goto err;
++
++    /* Aggregate results per signer */
++    for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
++        si = sk_CMS_SignerInfo_value(sinfos, i);
++
++        if (si->verify_failure)
++            continue;
++        if (!(flags & CMS_NO_SIGNER_CERT_VERIFY) && !si->cert_verified)
++            continue;
++        if (!(flags & CMS_NO_ATTR_VERIFY) && !si->attr_verified)
++            continue;
++        if (!(flags & CMS_NO_CONTENT_VERIFY) && !si->content_verified)
++            continue;
++
++        si->verify_result = 1;
++    }
++
++    /* Determine overall result */
++    if (flags & CMS_VERIFY_PARTIAL) {
++        /* One success is enough */
++        for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
++            si = sk_CMS_SignerInfo_value(sinfos, i);
++            if (si->verify_result == 1) {
++                ret = 1;
++                break;
++            }
++        }
++    } else {
++        /* All must be successful */
++        ret = 1;
++        for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
++            si = sk_CMS_SignerInfo_value(sinfos, i);
++            if (si->verify_result == 0) {
++                ret = 0;
++                break;
++            }
++        }
++    }
+  err:
+     if (!(flags & SMIME_BINARY) && dcont) {
+         do_free_upto(cmsbio, tmpout);
+diff --git a/doc/man1/openssl-cms.pod.in b/doc/man1/openssl-cms.pod.in
+index 36f1b3e4a82c..31cee6acb720 100644
+--- a/doc/man1/openssl-cms.pod.in
++++ b/doc/man1/openssl-cms.pod.in
+@@ -101,6 +101,7 @@ Verification options:
+ [B<-noverify>]
+ [B<-nointern>]
+ [B<-cades>]
++[B<-verify_partial>]
+ [B<-verify_retcode>]
+ {- $OpenSSL::safe::opt_trust_synopsis -}
+ 
+@@ -566,6 +567,10 @@ The supplied certificates can still be used as untrusted CAs however.
+ When used with B<-verify>, require and check signer certificate digest.
+ See the NOTES section for more details.
+ 
++=item B<-verify_partial>
++
++Succeed if at least one signature can be verified.
++
+ =item B<-verify_retcode>
+ 
+ Exit nonzero on verification failure.
+diff --git a/doc/man3/CMS_verify.pod b/doc/man3/CMS_verify.pod
+index 9cc0d11818b1..ff0e71d88398 100644
+--- a/doc/man3/CMS_verify.pod
++++ b/doc/man3/CMS_verify.pod
+@@ -63,7 +63,8 @@ the content is detached I<detached_data> cannot be NULL.
+ An attempt is made to locate all the signing certificate(s), first looking in
+ the I<certs> parameter (if it is not NULL) and then looking in any
+ certificates contained in the I<cms> structure unless B<CMS_NOINTERN> is set.
+-If any signing certificate cannot be located the operation fails.
++If any signing certificate cannot be located the operation fails unless
++B<CMS_VERIFY_PARTIAL> is set.
+ 
+ Each signing certificate is chain verified using the I<smimesign> purpose and
+ using the trusted certificate store I<store> if supplied.
+@@ -72,12 +73,16 @@ L<CMS_add1_cert(3)>, are used as untrusted CAs.
+ If CRL checking is enabled in I<store> and B<CMS_NOCRL> is not set,
+ any internal CRLs, which may have been added using L<CMS_add1_crl(3)>,
+ are used in addition to attempting to look them up in I<store>.
+-If I<store> is not NULL and any chain verify fails an error code is returned.
++If I<store> is not NULL and any chain verify fails an error code is returned
++unless B<CMS_VERIFY_PARTIAL> is set.
+ 
+ Finally the signed content is read (and written to I<out> unless it is NULL)
+-and the signature is checked.
++and each signature is checked.
+ 
+-If all signatures verify correctly then the function is successful.
++The overall result of the function depends on whether B<CMS_VERIFY_PARTIAL> is
++set. When set, a single successfully verified signature is enough and
++L<CMS_get0_SignerInfos(3)> can be used to inspect each signature.
++Otherwise, the function is only successful if signatures verify correctly.
+ 
+ Any of the following flags (ored together) can be passed in the I<flags>
+ parameter to change the default verify behaviour.
+diff --git a/include/openssl/cms.h.in b/include/openssl/cms.h.in
+index 0ae75abdfe6f..3981c31d9f7c 100644
+--- a/include/openssl/cms.h.in
++++ b/include/openssl/cms.h.in
+@@ -99,6 +99,7 @@ CMS_ContentInfo *CMS_ContentInfo_new_ex(OSSL_LIB_CTX *libctx, const char *propq)
+ # define CMS_CADES                       0x100000
+ # define CMS_USE_ORIGINATOR_KEYID        0x200000
+ # define CMS_NO_SIGNING_TIME             0x400000
++# define CMS_VERIFY_PARTIAL              0x800000
+ 
+ const ASN1_OBJECT *CMS_get0_type(const CMS_ContentInfo *cms);
+ 
+diff --git a/test/recipes/80-test_cms.t b/test/recipes/80-test_cms.t
+index 5c967c581835..a698e703ab3f 100644
+--- a/test/recipes/80-test_cms.t
++++ b/test/recipes/80-test_cms.t
+@@ -53,7 +53,7 @@ my ($no_des, $no_dh, $no_dsa, $no_ec, $no_ec2m, $no_rc2, $no_zlib)
+ 
+ $no_rc2 = 1 if disabled("legacy");
+ 
+-plan tests => 30;
++plan tests => 31;
+ 
+ ok(run(test(["pkcs7_test"])), "test pkcs7");
+ 
+@@ -1463,3 +1463,80 @@ subtest "SLH-DSA tests for CMS" => sub {
+            "accept CMS verify with SLH-DSA-SHAKE-256s");
+     }
+ };
++
++subtest "sign and verify with multiple keys and -verify_partial" => sub {
++    plan tests => 9;
++
++    my $smrsa2 = catfile($smdir, "smrsa2.pem");
++    my $sig1 = "sig1.cms";
++    my $out1 = "out1.txt";
++    my $sig2 = "sig2.cms";
++    my $out2 = "out2.txt";
++
++    ok(run(app(['openssl', 'cms',
++                @defaultprov,
++                '-sign', '-in', $smcont,
++                '-nodetach',
++                '-signer', $smrsa1,
++                '-out', $sig1, '-outform', 'DER',
++               ])),
++       "sign with first key");
++    ok(run(app(['openssl', 'cms',
++                @defaultprov,
++                '-verify', '-in', $sig1, '-inform', 'DER',
++                '-CAfile', $smrsa1, '-partial_chain',
++                '-verify_partial',
++                '-out', $out1,
++               ])),
++       "verify single signature");
++    is(compare($smcont, $out1), 0, "compare original message with verified message");
++
++    # because the smrsa2 signature cannot be verified, overall verification fails
++    ok(!run(app(['openssl', 'cms',
++                 @defaultprov,
++                 '-verify', '-in', $sig1, '-inform', 'DER',
++                 '-CAfile', $smrsa2, '-partial_chain',
++                 '-verify_partial',
++                 '-out', $out2,
++                ])),
++       "try to verify rsa1 signature with only rsa2");
++
++    ok(run(app(['openssl', 'cms',
++                @defaultprov,
++                '-resign', '-in', $sig1, '-inform', 'DER',
++                '-signer', $smrsa2,
++                '-out', $sig2, '-outform', 'DER',
++               ])),
++       "resign with second key");
++
++    # because the smrsa1 signature can be verified, overall verification succeeds
++    ok(run(app(['openssl', 'cms',
++                @defaultprov,
++                '-verify', '-in', $sig2, '-inform', 'DER',
++                '-CAfile', $smrsa1, '-partial_chain',
++                '-verify_partial',
++                '-out', $out2,
++               ])),
++       "verify two signatures with only rsa1");
++
++    # because the smrsa1 signature can be verified, overall verification succeeds
++    ok(run(app(['openssl', 'cms',
++                @defaultprov,
++                '-verify', '-in', $sig2, '-inform', 'DER',
++                '-CAfile', $smrsa2, '-partial_chain',
++                '-verify_partial',
++                '-out', $out2,
++               ])),
++       "verify two signatures with only rsa2");
++
++    # because both signatures can be verified, overall verification succeeds
++    ok(run(app(['openssl', 'cms',
++                 @defaultprov,
++                 '-verify', '-in', $sig2, '-inform', 'DER',
++                 '-CAfile', $smroot,
++                 '-verify_partial',
++                 '-out', $out2,
++                ])),
++       "verify both signature signatures with root");
++    is(compare($smcont, $out2), 0, "compare original message with verified message");
++};
+-- 
+2.39.5
+

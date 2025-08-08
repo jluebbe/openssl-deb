@@ -1,0 +1,211 @@
+From 37b768332d58f63d95d7f3375fa6496d02bbab4c Mon Sep 17 00:00:00 2001
+From: Jan Luebbe <jlu@pengutronix.de>
+Date: Fri, 9 May 2025 09:54:15 +0200
+Subject: [PATCH 2/3] Implement access to CMS verification results per signer
+
+When verifying CMS messages with multiple signatures using
+CMS_VERIFY_PARTIAL to implement additional custom requirements
+regarding signatures from which certificates are required and/or
+acceptable, information on which signature was considered invalid and
+why by CMS_verify is useful for reporting or debugging.
+
+Implement this by adding CMS_SignerInfo-based access to certificates
+(CMS_SignerInfo_get0_signer_cert) and verification results
+(CMS_SignerInfo_get_verification_result). Also use these new functions
+to show more details when using 'openssl cms -verify' with
+'-verify_partial'.
+---
+ apps/cms.c                        | 33 +++++++++++++++++++++++++++++++
+ crypto/cms/cms_sd.c               | 26 ++++++++++++++++++++++++
+ doc/man3/CMS_get0_SignerInfos.pod | 21 +++++++++++++++++++-
+ include/openssl/cms.h.in          |  7 +++++++
+ util/libcrypto.num                |  2 ++
+ 5 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/apps/cms.c b/apps/cms.c
+index 8be95b94ab34..a338d700c618 100644
+--- a/apps/cms.c
++++ b/apps/cms.c
+@@ -1229,6 +1229,39 @@ int cms_main(int argc, char **argv)
+                 ret = verify_err + 32;
+             goto end;
+         }
++        if (flags & CMS_VERIFY_PARTIAL) {
++            int i;
++            STACK_OF(CMS_SignerInfo) *sinfos = CMS_get0_SignerInfos(cms);
++
++            for (i = 0; i < sk_CMS_SignerInfo_num(sinfos); i++) {
++                CMS_SignerInfo *si = sk_CMS_SignerInfo_value(sinfos, i);
++                X509 *si_signer = CMS_SignerInfo_get0_signer_cert(si);
++                X509_NAME *si_subject = NULL;
++
++                if (si_signer == NULL) {
++                    BIO_printf(bio_err, "Signer %d: no certificate\n", i);
++                    continue;
++                }
++
++                si_subject = X509_get_subject_name(si_signer);
++                if (si_subject == NULL) {
++                    BIO_printf(bio_err, "Signer %d: no subject name", i);
++                    continue;
++                }
++
++                BIO_printf(bio_err, "Signer %d: ", i);
++                X509_NAME_print_ex(bio_err, si_subject, 0, XN_FLAG_ONELINE);
++                BIO_printf(bio_err, "\n  Verification %s (cert: %s, attrs: %s, content: %s)\n",
++                           CMS_SignerInfo_get_verification_result(si, CMS_VERIFY_RESULT) ?
++                           "successful" : "failed",
++                           CMS_SignerInfo_get_verification_result(si, CMS_VERIFY_CERT) ?
++                           "success" : "failure",
++                           CMS_SignerInfo_get_verification_result(si, CMS_VERIFY_ATTR) ?
++                           "success" : "failure",
++                           CMS_SignerInfo_get_verification_result(si, CMS_VERIFY_CONTENT) ?
++                           "success" : "failure");
++            }
++        }
+         if (signerfile != NULL) {
+             STACK_OF(X509) *signers = CMS_get0_signers(cms);
+ 
+diff --git a/crypto/cms/cms_sd.c b/crypto/cms/cms_sd.c
+index 9d5b8607de0e..9a1459acb333 100644
+--- a/crypto/cms/cms_sd.c
++++ b/crypto/cms/cms_sd.c
+@@ -656,6 +656,11 @@ void CMS_SignerInfo_set1_signer_cert(CMS_SignerInfo *si, X509 *signer)
+     si->signer = signer;
+ }
+ 
++X509 *CMS_SignerInfo_get0_signer_cert(CMS_SignerInfo *si)
++{
++    return si->signer;
++}
++
+ int CMS_SignerInfo_get0_signer_id(CMS_SignerInfo *si,
+                                   ASN1_OCTET_STRING **keyid,
+                                   X509_NAME **issuer, ASN1_INTEGER **sno)
+@@ -734,6 +739,27 @@ ASN1_OCTET_STRING *CMS_SignerInfo_get0_signature(CMS_SignerInfo *si)
+     return si->signature;
+ }
+ 
++int CMS_SignerInfo_get_verification_result(CMS_SignerInfo *si, int type)
++{
++    switch (type) {
++    case CMS_VERIFY_RESULT:
++        return si->verify_result && !si->verify_failure;
++
++    case CMS_VERIFY_CERT:
++        return si->cert_verified;
++
++    case CMS_VERIFY_ATTR:
++        return si->attr_verified;
++
++    case CMS_VERIFY_CONTENT:
++        return si->content_verified;
++
++    default:
++        ERR_raise(ERR_LIB_CMS, CMS_R_UNKNOWN_ID);
++        return 0;
++    }
++}
++
+ static int cms_SignerInfo_content_sign(CMS_ContentInfo *cms,
+                                        CMS_SignerInfo *si, BIO *chain,
+                                        const unsigned char *md,
+diff --git a/doc/man3/CMS_get0_SignerInfos.pod b/doc/man3/CMS_get0_SignerInfos.pod
+index 46dba9cde082..f894c5d7d04a 100644
+--- a/doc/man3/CMS_get0_SignerInfos.pod
++++ b/doc/man3/CMS_get0_SignerInfos.pod
+@@ -3,8 +3,10 @@
+ =head1 NAME
+ 
+ CMS_SignerInfo_set1_signer_cert,
++CMS_SignerInfo_get0_signer_cert,
+ CMS_get0_SignerInfos, CMS_SignerInfo_get0_signer_id,
+-CMS_SignerInfo_get0_signature, CMS_SignerInfo_cert_cmp
++CMS_SignerInfo_get0_signature, CMS_SignerInfo_cert_cmp,
++CMS_SignerInfo_get_verification_result
+ - CMS signedData signer functions
+ 
+ =head1 SYNOPSIS
+@@ -18,6 +20,8 @@ CMS_SignerInfo_get0_signature, CMS_SignerInfo_cert_cmp
+  ASN1_OCTET_STRING *CMS_SignerInfo_get0_signature(CMS_SignerInfo *si);
+  int CMS_SignerInfo_cert_cmp(CMS_SignerInfo *si, X509 *cert);
+  void CMS_SignerInfo_set1_signer_cert(CMS_SignerInfo *si, X509 *signer);
++ X509 *CMS_SignerInfo_get0_signer_cert(CMS_SignerInfo *si);
++ int CMS_SignerInfo_get_verification_result(CMS_SignerInfo *si, int type);
+ 
+ =head1 DESCRIPTION
+ 
+@@ -41,6 +45,16 @@ if not.
+ CMS_SignerInfo_set1_signer_cert() sets the signer's certificate of B<si> to
+ B<signer>.
+ 
++CMS_SignerInfo_get0_signer_cert() returns the signer's certificate associated
++with B<si>. This pointer should not be freed.
++
++CMS_SignerInfo_get_verification_result() returns whether a specific aspect of
++the signature verification was successful after calling L<CMS_verify(3)> with
++the flag B<CMS_VERIFIY_PARTIAL>. Pass B<CMS_VERIFIY_RESULT> as B<type> to get
++the overall result, B<CMS_VERIFIY_CERT> for certificate verification,
++B<CMS_VERIFIY_ATTR> for attribute verification and B<CMS_VERIFY_CONTENT> for
++content verification.
++
+ =head1 NOTES
+ 
+ The main purpose of these functions is to enable an application to lookup
+@@ -78,6 +92,11 @@ Any error can be obtained from L<ERR_get_error(3)>
+ 
+ L<ERR_get_error(3)>, L<CMS_verify(3)>
+ 
++=head1 HISTORY
++
++B<CMS_SignerInfo_get0_signer_cert> and
++B<CMS_SignerInfo_get_verification_result> were added in OpenSSL 3.6.
++
+ =head1 COPYRIGHT
+ 
+ Copyright 2008-2025 The OpenSSL Project Authors. All Rights Reserved.
+diff --git a/include/openssl/cms.h.in b/include/openssl/cms.h.in
+index 3981c31d9f7c..610011df0d6e 100644
+--- a/include/openssl/cms.h.in
++++ b/include/openssl/cms.h.in
+@@ -71,6 +71,11 @@ CMS_ContentInfo *CMS_ContentInfo_new_ex(OSSL_LIB_CTX *libctx, const char *propq)
+ # define CMS_RECIPINFO_PASS              3
+ # define CMS_RECIPINFO_OTHER             4
+ 
++# define CMS_VERIFY_RESULT               0
++# define CMS_VERIFY_CERT                 1
++# define CMS_VERIFY_ATTR                 2
++# define CMS_VERIFY_CONTENT              3
++
+ /* S/MIME related flags */
+ 
+ # define CMS_TEXT                        0x1
+@@ -288,6 +293,7 @@ EVP_MD_CTX *CMS_SignerInfo_get0_md_ctx(CMS_SignerInfo *si);
+ STACK_OF(CMS_SignerInfo) *CMS_get0_SignerInfos(CMS_ContentInfo *cms);
+ 
+ void CMS_SignerInfo_set1_signer_cert(CMS_SignerInfo *si, X509 *signer);
++X509 *CMS_SignerInfo_get0_signer_cert(CMS_SignerInfo *si);
+ int CMS_SignerInfo_get0_signer_id(CMS_SignerInfo *si,
+                                   ASN1_OCTET_STRING **keyid,
+                                   X509_NAME **issuer, ASN1_INTEGER **sno);
+@@ -298,6 +304,7 @@ void CMS_SignerInfo_get0_algs(CMS_SignerInfo *si, EVP_PKEY **pk,
+                               X509 **signer, X509_ALGOR **pdig,
+                               X509_ALGOR **psig);
+ ASN1_OCTET_STRING *CMS_SignerInfo_get0_signature(CMS_SignerInfo *si);
++int CMS_SignerInfo_get_verification_result(CMS_SignerInfo *si, int type);
+ int CMS_SignerInfo_sign(CMS_SignerInfo *si);
+ int CMS_SignerInfo_verify(CMS_SignerInfo *si);
+ int CMS_SignerInfo_verify_content(CMS_SignerInfo *si, BIO *chain);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index ceb4948839a7..3fe82638c8f4 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -5924,3 +5924,5 @@ OSSL_AA_DIST_POINT_free                 6051	3_5_0	EXIST::FUNCTION:
+ OSSL_AA_DIST_POINT_new                  6052	3_5_0	EXIST::FUNCTION:
+ OSSL_AA_DIST_POINT_it                   6053	3_5_0	EXIST::FUNCTION:
+ PEM_ASN1_write_bio_ctx                  6054	3_5_0	EXIST::FUNCTION:
++CMS_SignerInfo_get0_signer_cert         ?	3_5_0	EXIST::FUNCTION:CMS
++CMS_SignerInfo_get_verification_result  ?	3_5_0	EXIST::FUNCTION:CMS
+-- 
+2.39.5
+

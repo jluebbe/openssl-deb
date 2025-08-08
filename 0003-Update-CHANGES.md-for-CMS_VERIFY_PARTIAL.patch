@@ -1,0 +1,38 @@
+From ab20c5a8d4874eaeca0b6221ec3324fa87b75aa4 Mon Sep 17 00:00:00 2001
+From: Jan Luebbe <jlu@pengutronix.de>
+Date: Fri, 9 May 2025 10:35:10 +0200
+Subject: [PATCH 3/3] Update CHANGES.md for CMS_VERIFY_PARTIAL
+
+---
+ CHANGES.md | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 2978ebfa2d10..8f71cda2cc79 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -30,6 +30,21 @@ OpenSSL 3.5
+ 
+ ### Changes between 3.5.0 and 3.5.1 [1 Jul 2025]
+ 
++ * Add `CMS_VERIFY_PARTIAL` flag to `CMS_verify()` and `-verify_partial` option
++   to `openssl cms -verify`.
++
++   If this flag is set, the call is successful even if some of the individual
++   signatures cannot be verified (perhaps due to CAs missing from the local
++   store or expired certificates). The application would then call
++   `CMS_get0_signers()` and check if the set of valid signatures satisfies its
++   policy.
++
++   To access detailed verification results, the new functions
++   `CMS_SignerInfo_get_verification_result()` and
++   `CMS_SignerInfo_get0_signer_cert()` can be used.
++
++   *Jan Lübbe*
++
+  * Fix x509 application adds trusted use instead of rejected use.
+ 
+    Issue summary: Use of -addreject option with the openssl x509 application adds
+-- 
+2.39.5
+

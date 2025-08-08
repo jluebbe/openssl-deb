@@ -1,0 +1,40 @@
+name: Build OpenSSL Debian package
+on:
+  push:
+    branches:
+    - '*'
+  create:
+    tags:
+    - '*'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+    - name: Install dependencies
+      run: |
+        sed -i 's/^Types: .*/Types: deb deb-src/' /etc/apt/sources.list.d/*.sources
+        apt-get update -q
+        apt-get install -y devscripts
+        apt-get build-dep -y openssl
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Build package
+      run: |
+        apt-get source openssl
+        cd openssl-*
+        ls -l
+        patch -p1 < ../0001-Implement-partial-verification-for-CMS-with-multiple.patch
+        patch -p1 < ../0002-Implement-access-to-CMS-verification-results-per-sig.patch
+        patch -p1 < ../0003-Update-CHANGES.md-for-CMS_VERIFY_PARTIAL.patch
+        dch -n "Rebuild with patches"
+        dpkg-buildpackage -us -uc -b -j$(nproc)
+    - name: Show results
+      run: |
+        ls -l
+        cat *.changes
+    - name: Create release
+      if: github.event_name == 'create'
+      uses: softprops/action-gh-release@v2
+      with:
+        files: '*.deb'
